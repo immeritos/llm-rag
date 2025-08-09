@@ -1,0 +1,1 @@
+{"indexed_fields":{"course":"keyword"},"indexed_types":{"course":[{"index_type":"keyword_index","mutability":"mutable","storage_type":"rocks_db"},{"index_type":"null_index","mutability":"mutable","storage_type":{"mmap":{"is_on_disk":true}}}]}}
