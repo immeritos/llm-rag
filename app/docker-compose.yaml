@@ -1,0 +1,81 @@
+
+services:
+  # 向量数据库：Qdrant
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    ports:
+      - "6333:6333"        # HTTP API
+      - "6334:6334"        # gRPC（如果不用可去掉）
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      # 如果你启用了鉴权，取消下一行注释并在 .env 中设置 QDRANT_API_KEY
+      # QDRANT__SERVICE__API_KEY: ${QDRANT_API_KEY}
+      QDRANT__TELEMETRY_DISABLED: "true"
+
+  # 关系数据库：PostgreSQL
+  postgres:
+    image: postgres:13
+    container_name: postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # 前端 + 应用：Streamlit
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: streamlit
+    environment:
+      # —— 你代码里会读取到的变量 ——
+      - QDRANT_URL=http://qdrant:6333
+      - COLLECTION_NAME=${COLLECTION_NAME}
+      - DENSE_MODEL_NAME=${DENSE_MODEL_NAME}
+
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+
+      # （可选）如果你使用 Qdrant API Key，并在代码里支持，可传下去
+      # - QDRANT_API_KEY=${QDRANT_API_KEY}
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    depends_on:
+      qdrant:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+  # （可选）Grafana，用于看一些自定义仪表盘（依赖你自己做数据源配置）
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    depends_on:
+      - postgres
+
+volumes:
+  qdrant_data:
+  postgres_data:
+  grafana_data:
