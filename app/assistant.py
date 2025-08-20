@@ -31,18 +31,18 @@ def get_embedding_model():
     return _embedding_model
 
 
-def search_documents(query: str, course: str = None, limit: int = 5) -> List[models.ScoredPoint]:
+def search_documents(query: str, section: str = None, limit: int = 5) -> List[models.ScoredPoint]:
     """Perform RRF (Reciprocal Rank Fusion) hybrid search combining dense and sparse vectors."""
     embedding_model = get_embedding_model()
     query_embedding = list(embedding_model.embed([query]))[0]
     
     search_filter = None
-    if course:
+    if section:
         search_filter = models.Filter(
             must=[
                 models.FieldCondition(
-                    key="course",
-                    match=models.MatchValue(value=course)
+                    key="section",
+                    match=models.MatchValue(value=section)
                 )
             ]
         )
@@ -77,7 +77,8 @@ def search_documents(query: str, course: str = None, limit: int = 5) -> List[mod
 def build_prompt(query: str, search_results: List[models.ScoredPoint]) -> str:
     """Build prompt for LLM with context from search results."""
     prompt_template = """
-You're a course teaching assistant. Answer the QUESTION based on the CONTEXT from the FAQ database.
+You are a psychologist specialized in ADHD.
+Answer the QUESTION based on the CONTEXT from the reference database.
 Use only the facts from the CONTEXT when answering the QUESTION.
 
 QUESTION: {question}
@@ -86,14 +87,28 @@ CONTEXT:
 {context}
 """.strip()
 
-    context = "\n\n".join([
-        f"section: {result.payload.get('section', 'N/A')}\n"
-        f"question: {result.payload.get('question', 'N/A')}\n"
-        f"answer: {result.payload.get('text', 'N/A')}"
-        for result in search_results
-    ])
-    
-    return prompt_template.format(question=query, context=context).strip()
+    context_blocks = []
+    for r in search_results:
+        p = r.payload or {}
+        source = p.get("source", "adhd_guideline")
+        section = p.get("section") or p.get("breadcrumb") or "N/A"
+        page_start = p.get("page_start", "N/A")
+        page_end = p.get("page_end", "N/A")
+        highlighted = (p.get("highlighted_text") or "").strip()
+        body = highlighted if highlighted else (p.get("text") or "").strip()
+        body = body.replace("\n", " ").strip()
+
+        block = (
+            f"[SOURCE] {source}\n"
+            f"[SECTION] {section}\n"
+            f"[PAGES] {page_start}–{page_end}\n"
+            f"[EXTRACT] {body}"
+        )
+        context_blocks.append(block)
+
+    context = "\n\n---\n\n".join(context_blocks) if context_blocks else "No context."
+
+    return prompt_template.format(question=query.strip(), context=context).strip()
 
 
 def llm(prompt: str, model_choice: str) -> tuple[str, dict, float]:
@@ -177,10 +192,10 @@ def calculate_openai_cost(model_choice: str, tokens: dict) -> float:
     return cost
 
 
-def get_answer(query: str, course: str = None, model_choice: str = "openai/gpt-4o-mini", 
+def get_answer(query: str, section: str = None, model_choice: str = "openai/gpt-4o-mini", 
                search_limit: int = 5, evaluate: bool = False) -> Dict[str, Any]:
     """Get answer for a query using RAG pipeline."""
-    search_results = search_documents(query, course, search_limit)
+    search_results = search_documents(query, section, search_limit)
     
     if not search_results:
         return {
@@ -212,13 +227,15 @@ def get_answer(query: str, course: str = None, model_choice: str = "openai/gpt-4
     
     result['search_results'] = [
         {
-            'score': float(result.score),
-            'course': result.payload.get('course', 'N/A'),
-            'section': result.payload.get('section', 'N/A'),
-            'question': result.payload.get('question', 'N/A'),
-            'text': result.payload.get('text', 'N/A')
+            'score': float(r.score),
+            'source': r.payload.get('source', 'adhd_guideline'),
+            'section': r.payload.get('section', r.payload.get('breadcrumb', 'N/A')),
+            'breadcrumb': r.payload.get('breadcrumb', 'N/A'),
+            'page_start': r.payload.get('page_start', None),
+            'page_end': r.payload.get('page_end', None),
+            'text': (r.payload.get('highlighted_text') or r.payload.get('text', 'N/A'))
         }
-        for result in search_results
+        for r in search_results
     ]
     
     if evaluate:
