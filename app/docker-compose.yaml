@@ -38,11 +38,19 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: streamlit
+    working_dir: /app
+    command: >
+      bash -lc 'streamlit run ${STREAMLIT_MAIN:-app.py}
+      --server.port 8501 --server.address 0.0.0.0'
+    volumes:
+      - .:/app
+      - ./data:/data:ro 
     environment:
       # —— 你代码里会读取到的变量 ——
       - QDRANT_URL=http://qdrant:6333
       - COLLECTION_NAME=${COLLECTION_NAME}
       - DENSE_MODEL_NAME=${DENSE_MODEL_NAME}
+
 
       - POSTGRES_HOST=postgres
       - POSTGRES_DB=${POSTGRES_DB}
