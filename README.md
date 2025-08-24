@@ -1,4 +1,4 @@
-LLM-RAG Course Assistant
+### LLM-RAG Course Assistant
 
 A lightweight RAG-based Q&A chatbot for course materials, built with:
 
@@ -10,7 +10,7 @@ Qdrant for vector search
 
 Postgres for storing conversations and feedback
 
-🚀 Features
+## 🚀 Features
 
 Select different OpenAI models (e.g., gpt-3.5-turbo, gpt-4o, etc.)
 
@@ -22,11 +22,13 @@ Feedback collection (+1 / -1) for model evaluation
 
 Simple monitoring via feedback stats
 
-📦 Requirements
+## 📦 Requirements
 
 Docker & Docker Compose
 
 An OpenAI API Key
+
+## Quick test plan
 
 1) Build & start services
 ```
