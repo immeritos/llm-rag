@@ -1,7 +1,7 @@
 import os
 import time
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from openai import OpenAI
 from qdrant_client import QdrantClient, models
@@ -15,6 +15,13 @@ QDRANT_URL = os.getenv("QDRANT_URL")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME")
 DENSE_MODEL_NAME = os.getenv("DENSE_MODEL_NAME")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+JSONL_PATH = os.getenv(
+    "JSONL_PATH",
+    os.path.join(BASE_DIR, "data", "adhd_guideline.jsonl")
+)
+MAX_EXTRACT_CHARS = 1200
+TOPK_USE = None  
 
 # Initialize clients
 qdrant_client = QdrantClient(QDRANT_URL)
@@ -31,22 +38,54 @@ def get_embedding_model():
     return _embedding_model
 
 
-def search_documents(query: str, section: str = None, limit: int = 5) -> List[models.ScoredPoint]:
-    """Perform RRF (Reciprocal Rank Fusion) hybrid search combining dense and sparse vectors."""
+def _with_retrievable_filter(
+    base_must: Optional[list],
+    include_unretrievable: bool
+) -> list:
+    must = list(base_must or [])
+    if not include_unretrievable:
+        must.append(models.FieldCondition(
+            key="retrievable",
+            match=models.MatchValue(value=True),
+        ))
+    return must
+
+def search_documents(
+    query: str,
+    *,
+    section_title: Optional[str] = None,        # e.g. "Baseline assessment"
+    tags: Optional[List[str]] = None,           # e.g. ["medication"]
+    population: Optional[List[str]] = None,     # e.g. ["adults"]
+    limit: int = 5,
+    include_unretrievable: bool = False,        # 管理员开关
+) -> List[models.ScoredPoint]:
+    """RRF (dense+sparse) 混合检索，按新payload字段过滤。"""
     embedding_model = get_embedding_model()
     query_embedding = list(embedding_model.embed([query]))[0]
-    
-    search_filter = None
-    if section:
-        search_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="section",
-                    match=models.MatchValue(value=section)
-                )
-            ]
-        )
-    
+
+    must = []
+
+    if section_title:
+        must.append(models.FieldCondition(
+            key="section_title",
+            match=models.MatchValue(value=section_title),
+        ))
+
+    if tags:
+        must.append(models.FieldCondition(
+            key="tags",
+            match=models.MatchAny(any=tags),
+        ))
+
+    if population:
+        must.append(models.FieldCondition(
+            key="population",
+            match=models.MatchAny(any=population),
+        ))
+
+    must = _with_retrievable_filter(must, include_unretrievable)
+    search_filter = models.Filter(must=must) if must else None
+
     results = qdrant_client.query_points(
         collection_name=COLLECTION_NAME,
         prefetch=[
@@ -57,10 +96,7 @@ def search_documents(query: str, section: str = None, limit: int = 5) -> List[mo
                 filter=search_filter,
             ),
             models.Prefetch(
-                query=models.Document(
-                    text=query,
-                    model="Qdrant/bm25",
-                ),
+                query=models.Document(text=query, model="Qdrant/bm25"),
                 using="sparse",
                 limit=limit * 5,
                 filter=search_filter,
@@ -69,45 +105,130 @@ def search_documents(query: str, section: str = None, limit: int = 5) -> List[mo
         query=models.FusionQuery(fusion=models.Fusion.RRF),
         limit=limit,
         with_payload=True,
+        with_vectors=False,
     )
-    
     return results.points
 
+_DOC_STORE = None  # id -> doc(dict)
+
+def _load_doc_store(path: str):
+    global _DOC_STORE
+    if _DOC_STORE is not None:
+        return _DOC_STORE
+    store = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            _id = obj.get("id")
+            if _id:
+                store[_id] = obj
+    _DOC_STORE = store
+    return _DOC_STORE
+
+def _get_doc_by_id(pid: str):
+    store = _load_doc_store(JSONL_PATH)
+    return store.get(pid)
+
+def build_text(doc: dict) -> str:
+
+    # 1) 标题（title_path -> section_id + section_title）
+    tp = doc.get("title_path")
+    if isinstance(tp, str) and tp.strip():
+        headline = tp.strip()
+    else:
+        sid = doc.get("section_id")
+        st  = doc.get("section_title")
+        # 仅拼接已有字段（不做分隔符拆分）
+        headline = " ".join([str(x) for x in (sid, st) if isinstance(x, str) and x.strip()]).strip()
+
+    # 2) 主体（原样）
+    parts = []
+    body_main = doc.get("text") or doc.get("content") or ""
+    if isinstance(body_main, str) and body_main:
+        parts.append(body_main)
+
+    for key in ("bullets", "notes", "recommendations"):
+        val = doc.get(key)
+        if isinstance(val, list) and val:
+            parts.append("\n".join([str(x) for x in val if x is not None]))
+        elif isinstance(val, str) and val:
+            parts.append(val)
+
+    body = "\n".join(parts).strip()
+
+    # 3) 合并
+    combined = f"{headline}\n{body}".strip() if headline else body
+    return combined
+
+
+def _extract_body(pid: str, limit: int = MAX_EXTRACT_CHARS) -> str:
+    doc = _get_doc_by_id(pid)
+    if not doc:
+        return ""
+    try:
+        full = build_text(doc)  # 你当前的 build_text：标题+主体，原样，不清洗、不chunk
+    except Exception:
+        # 兜底：尽力拼一点正文
+        full = (doc.get("text") or doc.get("content") or "") or ""
+        if isinstance(doc.get("bullets"), list):
+            full = f"{full}\n" + "\n".join(str(x) for x in doc["bullets"] if x is not None)
+    full = full if isinstance(full, str) else str(full)
+    if limit and len(full) > limit:
+        return full[:limit].rstrip() + " …"
+    return full
 
 def build_prompt(query: str, search_results: List[models.ScoredPoint]) -> str:
-    """Build prompt for LLM with context from search results."""
-    prompt_template = """
-You are a psychologist specialized in ADHD.
-Answer the QUESTION based on the CONTEXT from the reference database.
-Use only the facts from the CONTEXT when answering the QUESTION.
+    """
+    构建 LLM 提示词（能从 payload 拿的都用 payload；正文仅回 JSONL 一次查表）。
+    """
+    prompt_template = (
+        "You are a psychologist specialized in ADHD.\n"
+        "Answer the QUESTION based on the CONTEXT from the reference database.\n"
+        "Use only the facts from the CONTEXT when answering the QUESTION.\n\n"
+        "QUESTION: {question}\n\n"
+        "CONTEXT:\n{context}\n"
+    )
 
-QUESTION: {question}
+    blocks = []
+    pts = search_results if TOPK_USE is None else search_results[:TOPK_USE]
 
-CONTEXT: 
-{context}
-""".strip()
+    for r in pts:
+        pid = getattr(r, "id", None) or (r.get("id") if isinstance(r, dict) else None)
+        payload = getattr(r, "payload", None) or (r.get("payload") if isinstance(r, dict) else {}) or {}
+        if not pid:
+            continue
 
-    context_blocks = []
-    for r in search_results:
-        p = r.payload or {}
-        source = p.get("source", "adhd_guideline")
-        section = p.get("section") or p.get("breadcrumb") or "N/A"
-        page_start = p.get("page_start", "N/A")
-        page_end = p.get("page_end", "N/A")
-        highlighted = (p.get("highlighted_text") or "").strip()
-        body = highlighted if highlighted else (p.get("text") or "").strip()
-        body = body.replace("\n", " ").strip()
+        section_title = payload.get("section_title")
+        source = payload.get("source")
+        dates = payload.get("dates", {})
+        
+        # 处理日期信息
+        date_info = ""
+        if isinstance(dates, dict):
+            if dates.get("last_updated"):
+                date_info = f"  (updated: {dates['last_updated']})"
+            elif dates.get("published"):
+                date_info = f"  (published: {dates['published']})"
+                
+        extract = _extract_body(pid, limit=MAX_EXTRACT_CHARS)
+
+        # 如果没取到正文，就只展示题头元信息
+        if not extract:
+            extract = "[No extract available in payload; body not found in JSONL]"
 
         block = (
-            f"[SOURCE] {source}\n"
-            f"[SECTION] {section}\n"
-            f"[PAGES] {page_start}–{page_end}\n"
-            f"[EXTRACT] {body}"
+            f"[TITLE] {section_title}\n"
+            f"[SOURCE] {source}{date_info}\n"
+            f"[EXTRACT]\n{extract}"
         )
-        context_blocks.append(block)
+        blocks.append(block)
 
-    context = "\n\n---\n\n".join(context_blocks) if context_blocks else "No context."
-
+    context = "\n\n---\n\n".join(blocks) if blocks else "No context."
     return prompt_template.format(question=query.strip(), context=context).strip()
 
 
@@ -192,10 +313,17 @@ def calculate_openai_cost(model_choice: str, tokens: dict) -> float:
     return cost
 
 
-def get_answer(query: str, section: str = None, model_choice: str = "openai/gpt-4o-mini", 
+def get_answer(query: str, section_title: str = None, tags: List[str] = None, 
+               population: List[str] = None, model_choice: str = "openai/gpt-4o-mini", 
                search_limit: int = 5, evaluate: bool = False) -> Dict[str, Any]:
     """Get answer for a query using RAG pipeline."""
-    search_results = search_documents(query, section, search_limit)
+    search_results = search_documents(
+        query, 
+        section_title=section_title,
+        tags=tags,
+        population=population,
+        limit=search_limit
+    )
     
     if not search_results:
         return {
@@ -228,12 +356,13 @@ def get_answer(query: str, section: str = None, model_choice: str = "openai/gpt-
     result['search_results'] = [
         {
             'score': float(r.score),
-            'source': r.payload.get('source', 'adhd_guideline'),
-            'section': r.payload.get('section', r.payload.get('breadcrumb', 'N/A')),
-            'breadcrumb': r.payload.get('breadcrumb', 'N/A'),
-            'page_start': r.payload.get('page_start', None),
-            'page_end': r.payload.get('page_end', None),
-            'text': (r.payload.get('highlighted_text') or r.payload.get('text', 'N/A'))
+            'id': r.id,
+            'source': r.payload.get('source', ''),
+            'section_title': r.payload.get('section_title', ''),
+            'title_path': r.payload.get('title_path', ''),
+            'tags': r.payload.get('tags', []),
+            'population': r.payload.get('population', []),
+            'retrievable': r.payload.get('retrievable', True)
         }
         for r in search_results
     ]

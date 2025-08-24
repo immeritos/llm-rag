@@ -1,7 +1,8 @@
 import os
+import re
 import json
 import uuid
-from typing import Iterable, Dict, Any, List
+from typing import Iterable, Dict, Any, List, Union
 
 from tqdm.auto import tqdm
 from dotenv import load_dotenv
@@ -17,7 +18,7 @@ DENSE_MODEL_NAME = os.getenv("DENSE_MODEL_NAME")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOCS_JSONL = os.getenv(
     "DOCS_JSONL",
-    os.path.join(BASE_DIR, "data", "adhd_guideline_preprocessed.jsonl")
+    os.path.join(BASE_DIR, "data", "adhd_guideline.jsonl")
 )
 
 print(">>> DEBUG: DOCS_JSONL resolved to:", DOCS_JSONL)
@@ -83,15 +84,54 @@ def setup_qdrant(embedding_model: TextEmbedding) -> QdrantClient:
 # -------------------------
 def build_text(doc: dict) -> str:
     """
-    组合用于向量化的文本：
-    - 优先使用 highlighted_text，其次 text
-    - 在前面拼上 breadcrumb / section 作为轻量上下文
+    构建向量化文本（极简版）：
+    1) 标题：优先使用 title_path；否则用 section_id + section_title（原样，不清洗）
+    2) 主体：text 或 content（原样）+ bullets/notes/recommendations（原样逐条拼接）
     """
-    headline = " ".join([x for x in [doc.get("breadcrumb", ""), doc.get("section", "")] if x]).strip()
-    body = (doc.get("highlighted_text") or doc.get("text") or "").strip()
+    # 1) 标题（title_path -> section_id + section_title）
+    tp = doc.get("title_path")
+    if isinstance(tp, str) and tp.strip():
+        headline = tp.strip()
+    else:
+        sid = doc.get("section_id")
+        st  = doc.get("section_title")
+        # 仅拼接已有字段（不做分隔符拆分）
+        headline = " ".join([str(x) for x in (sid, st) if isinstance(x, str) and x.strip()]).strip()
+
+    # 2) 主体（原样）
+    parts = []
+    body_main = doc.get("text") or doc.get("content") or ""
+    if isinstance(body_main, str) and body_main:
+        parts.append(body_main)
+
+    for key in ("bullets", "notes", "recommendations"):
+        val = doc.get(key)
+        if isinstance(val, list) and val:
+            parts.append("\n".join([str(x) for x in val if x is not None]))
+        elif isinstance(val, str) and val:
+            parts.append(val)
+
+    body = "\n".join(parts).strip()
+
+    # 3) 合并
     combined = f"{headline}\n{body}".strip() if headline else body
     return combined
 
+def build_metadata(doc: dict) -> dict:
+    # 保持原样放进 payload，供过滤/排序/展示用
+    return {
+        "id": doc.get("id"),
+        "doc_type": doc.get("doc_type"),
+        "source": doc.get("source"),
+        "dates": doc.get("dates"),
+        "section_id": doc.get("section_id"),
+        "section_title": doc.get("section_title"),
+        "title_path": doc.get("title_path"),
+        "population": doc.get("population") or [],
+        "tags": doc.get("tags") or [],
+        "retrievable": doc.get("retrievable"),
+    }
+    
 # -------------------------
 # Batched embedding + upsert
 # -------------------------
@@ -100,7 +140,11 @@ def index_documents(
     embedding_model: TextEmbedding,
     docs_stream: Iterable[Dict[str, Any]],
     batch_size: int = 256,
+    collection_name: str = None,
 ):
+    if collection_name is None:
+        collection_name = COLLECTION_NAME
+        
     print("Indexing documents...")
 
     buffer_docs: List[Dict[str, Any]] = []
@@ -116,6 +160,7 @@ def index_documents(
         points = []
         for d, vec in zip(batch, dense_embeds):
             # 规范 id：尽量使用原始 id，否则生成 uuid4
+            meta = build_metadata(d)
             pid = d.get("id") or str(uuid.uuid4())
 
             # 稀疏向量采用服务器端BM25：直接给 Document 即可
@@ -129,26 +174,8 @@ def index_documents(
                     ),
                 },
                 payload={
-                    # 主文本：保留原始 text 和 highlighted_text（若存在）
-                    "text": doc.get("text", ""),
-                    "highlighted_text": doc.get("highlighted_text", ""),
-
-                    # 文档位置信息
-                    "source": doc.get("source", ""),               # e.g., "adhd_guideline"
-                    "section": doc.get("section", ""),             # e.g., "Overview"
-                    "breadcrumb": doc.get("breadcrumb", ""),       # e.g., "Overview"
-                    "page_start": doc.get("page_start", None),
-                    "page_end": doc.get("page_end", None),
-
-                    # 辅助标签/参考
-                    "side_labels": doc.get("side_labels", []),     # list
-                    "refs": doc.get("refs", []),                   # list
-
-                    # 便于追踪：原始 id + 用于检索融合的 combined_text（可选）
-                    "source_id": doc.get("id", ""),
-                    "combined_text": doc.get("_combined_text", ""),  # 可在调试/检索分析时查看
+                    **meta,  # 元数据用于过滤/排序/展示
                 },
-
             )
             points.append(point)
 
@@ -156,6 +183,8 @@ def index_documents(
 
     total = 0
     for doc in tqdm(docs_stream, desc="Reading JSONL"):
+        meta = build_metadata(doc)
+        
         combined = build_text(doc)
         doc["_combined_text"] = combined
         buffer_docs.append(doc)
